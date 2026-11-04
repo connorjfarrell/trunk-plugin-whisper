@@ -20,3 +20,4 @@ jobs:
         run: |
           cargo run --locked --quiet -- --describe > manifest.json
           python3 .github/check_manifest.py manifest.json
+
