@@ -1,0 +1,24 @@
+[package]
+# Your plugin's id: lowercase letters, digits and dashes. It names the
+# executable, the release files and the plugin's entry in the registry.
+name = "whisper"
+version = "0.1.0"
+edition = "2024"
+description = "Transcribes recorded calls with a Whisper server, choosing the model by system and talkgroup."
+license = "MIT"
+repository = "https://github.com/connorjfarrell/trunk-plugin-whisper"
+authors = ["Connor Farrell"]
+publish = false
+
+[dependencies]
+trunk-recorder-plugin = "0.8.0"
+# The settings form is drawn from your config structs' JSON Schema. Keep the
+# major version the SDK uses (1).
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+
+[profile.release]
+strip = true
+lto = true
