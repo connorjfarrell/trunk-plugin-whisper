@@ -94,7 +94,12 @@ already have a transcript are skipped, so leaving it set is harmless. `backfill.
 
 `server/Dockerfile` builds whisper.cpp with Vulkan. `server/run.sh` starts the three containers on the loopback
 (`8081` small.en, `8082` large-v3-turbo with `-ac 640`, `8083` large-v3-turbo), with the silence filter (VAD) on,
-which Whisper needs to avoid inventing words in the gaps. Models come from
+which Whisper needs to avoid inventing words in the gaps. `EXTRA_CPU_CORES=6 ./run.sh` also starts a CPU copy on
+`8084`, for the plugin's `backfill.extraUrl`.
+
+**Start the servers with `--no-context`** (`run.sh` does). By default whisper-server carries the previous call's
+text into the next call as context, so every call after a garbled one comes out as the same looping phrase. Each
+call here is its own conversation, so it must be transcribed on its own. Models come from
 [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) and the VAD model from
 [ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad).
 

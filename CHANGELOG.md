@@ -13,4 +13,5 @@ Each version's section is its GitHub release notes.
   transcript is written beside both.
 - Earlier calls can be caught up on in the background, newest first and only while no new call is waiting, with
   an optional extra server working through the short ones beside the main one.
+- The servers must run with `--no-context`: without it a garbled call's text carries into the next calls. `server/run.sh` does.
 - A phrase that comes out three or more times in a row is cut to one and the transcript is marked `repeated`.
