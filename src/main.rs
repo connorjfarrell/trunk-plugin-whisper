@@ -65,6 +65,8 @@ struct Shared {
     backfill_finished: AtomicU64,
     /// When the last backfill conversations finished, for the rate.
     finish_times: Mutex<VecDeque<Instant>>,
+    /// When this run of the plugin started (the rate is over the time it has had, up to ten minutes).
+    started: Instant,
 }
 
 struct Whisper {
@@ -399,10 +401,11 @@ fn save_calls(path: &Path, calls: &[ConcludedCall]) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
-/// A saved call as a group again: its server and the copies it stands for were written on it ([`routed`]).
-fn group_from_call(call: ConcludedCall, servers: &[Server]) -> Option<(Group, bool)> {
+/// A saved call as a group again: the copies it stands for were written on it ([`routed`]), and so was its
+/// server, which `by_rules` (what the system's rules say now, when they can be asked) replaces.
+fn group_from_call(call: ConcludedCall, servers: &[Server], by_rules: Option<usize>) -> Option<(Group, bool)> {
     let r = route(&call)?;
-    let server = servers.iter().position(|s| s.name.trim().eq_ignore_ascii_case(&r.server)).unwrap_or(0);
+    let server = by_rules.or_else(|| servers.iter().position(|s| s.name.trim().eq_ignore_ascii_case(&r.server))).unwrap_or(0);
     Some((Group { best: Entry { arrived: Instant::now(), call, server }, copies: r.copies }, r.backfill))
 }
 
@@ -500,6 +503,7 @@ impl Plugin for Whisper {
             backfill_total: AtomicU64::new(0),
             backfill_finished: AtomicU64::new(0),
             finish_times: Mutex::new(VecDeque::new()),
+            started: Instant::now(),
         });
         if shared.systems.is_empty() {
             host.status(State::Warning, "No system is set to transcribe. Turn it on in a system's settings.");
@@ -519,7 +523,16 @@ impl Plugin for Whisper {
         for name in [SAVED_WAITING, SAVED_QUEUE] {
             let path = setup.data_dir.join(name);
             for call in read_saved(&path) {
-                if let Some((group, backfill)) = group_from_call(call, &shared.servers) {
+                // The rules as they are now decide where it goes, or whether it goes at all.
+                let system = shared.aliases.get(&call.call.short_name).unwrap_or(&call.call.short_name);
+                let by_rules = match shared.systems.get(system) {
+                    Some((plan, _)) => match plan.choose(&call.call) {
+                        Choice::Skip => continue,
+                        Choice::Server(i) => Some(i),
+                    },
+                    None => None,
+                };
+                if let Some((group, backfill)) = group_from_call(call, &shared.servers, by_rules) {
                     waiting.add(group, backfill);
                     revived += 1;
                 }
@@ -604,7 +617,9 @@ impl Plugin for Whisper {
                         let per_min = {
                             let t = sh.finish_times.lock().unwrap();
                             let recent = t.iter().filter(|f| f.elapsed() <= Duration::from_secs(600)).count();
-                            (recent >= 5).then(|| recent as f64 / 10.0)
+                            // Over the time there has been to finish them, up to ten minutes: at least two.
+                            let minutes = (sh.started.elapsed().as_secs_f64() / 60.0).min(10.0);
+                            (recent >= 5 && minutes >= 2.0).then(|| recent as f64 / minutes)
                         };
                         let text = progress_text(w.counts().0 + q.lock().unwrap().len(), total, finished, per_min);
                         if text != last_text {
@@ -745,6 +760,7 @@ mod tests {
             backfill_total: AtomicU64::new(0),
             backfill_finished: AtomicU64::new(0),
             finish_times: Mutex::new(VecDeque::new()),
+            started: Instant::now(),
         }
     }
 
@@ -811,8 +827,11 @@ mod tests {
         save_calls(&path, &[routed(&s, &group, false, None)]).unwrap();
         let back = read_saved(&path);
         assert_eq!(back.len(), 1);
-        let (g, backfill) = group_from_call(back.into_iter().next().unwrap(), &servers).unwrap();
+        let (g, backfill) = group_from_call(back.into_iter().next().unwrap(), &servers, None).unwrap();
         assert_eq!((g.best.server, g.copies, backfill), (1, vec!["other/x/5-1_2.0".to_string()], false));
+        // The system's rules, when they can be asked, decide the server instead of what was saved.
+        let (again, _) = group_from_call(read_saved(&path).into_iter().next().unwrap(), &servers, Some(0)).unwrap();
+        assert_eq!(again.best.server, 0);
         // A call whose audio is gone isn't brought back.
         std::fs::remove_file(dir.join("sys/a/5-1_1.0.wav")).unwrap();
         assert!(read_saved(&path).is_empty());
