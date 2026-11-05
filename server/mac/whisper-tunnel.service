@@ -1,0 +1,13 @@
+[Unit]
+Description=SSH tunnel to the Whisper server on the Mac mini (THE-MAC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=YOUR-USER
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -L 127.0.0.1:18080:127.0.0.1:8080 -L 127.0.0.1:18081:127.0.0.1:8081 THE-MAC
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

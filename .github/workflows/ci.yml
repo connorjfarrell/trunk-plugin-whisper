@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -20,3 +21,4 @@ jobs:
         run: |
           cargo run --locked --quiet -- --describe > manifest.json
           python3 .github/check_manifest.py manifest.json
+
