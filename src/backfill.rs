@@ -76,13 +76,28 @@ pub struct Found {
 }
 
 /// Calls of the systems in `plans` that started in `[from, to]`, have audio and no transcript yet, and that the system's plan would transcribe (and whose names contain one of `only`, when given).
-pub fn scan(capture_dir: &Path, plans: &HashMap<String, (Plan, String)>, from: i64, to: i64, only: &[String], min_call_s: f64) -> (Vec<Entry>, Found) {
+pub fn scan(
+    capture_dir: &Path,
+    plans: &HashMap<String, (Plan, String)>,
+    earlier: &[(String, String)],
+    from: i64,
+    to: i64,
+    only: &[String],
+    min_call_s: f64,
+) -> (Vec<Entry>, Found) {
     let mut out = Vec::new();
     let mut found = Found::default();
-    let mut systems: Vec<_> = plans.iter().collect();
-    systems.sort_by(|a, b| a.0.cmp(b.0));
+    // The folders to search, each with the plan of the system whose rules it follows: every system's own, then the
+    // earlier folders (calls under a name the recorder no longer has) with the system they were given.
+    let mut folders: Vec<(&String, &Plan)> = plans.iter().map(|(name, (plan, _))| (name, plan)).collect();
+    folders.sort_by(|a, b| a.0.cmp(b.0));
+    for (folder, system) in earlier {
+        if let (false, Some((plan, _))) = (plans.contains_key(folder), plans.get(system)) {
+            folders.push((folder, plan));
+        }
+    }
     // Folders are named by the day on the recorder's clock; a day either side covers any offset.
-    for (short_name, (plan, _)) in systems {
+    for (short_name, plan) in folders {
         for day in from.div_euclid(86_400) - 1..=to.div_euclid(86_400) + 1 {
             let (y, m, d) = civil_from_days(day);
             let dir = capture_dir.join(short_name).join(y.to_string()).join(m.to_string()).join(d.to_string());
@@ -173,6 +188,56 @@ mod tests {
         }
     }
 
+    /// Reads the real recordings folder (run by hand: `cargo test real_scan -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn real_scan() {
+        let cfg = Config { servers: vec![Server { name: "fast".into(), url: "http://x/inference".into(), ..Default::default() }], ..Default::default() };
+        let sys = SystemConfig {
+            transcribe: true,
+            rules: vec![Rule { talkgroups: vec!["21".into(), "24".into(), "25".into(), "112-113".into()], text: String::new(), tier: "skip".into() }],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        for name in ["3BA_PAWMCO_800", "3BA_PAWMCO_700"] {
+            plans.insert(name.to_string(), (Plan::new(&cfg, &sys).unwrap(), String::new()));
+        }
+        let from = parse_time("2026-11-03T10:30:00-06:00").unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let t = std::time::Instant::now();
+        let (found, seen) = scan(Path::new("/data/trunk-pro/calls"), &plans, &[], from, now, &["plano pd".to_string(), "plano fd".to_string()], 1.0);
+        println!("scan took {:?}: {} calls to do, {:?}", t.elapsed(), found.len(), seen);
+    }
+
+    #[test]
+    fn calls_under_a_name_the_recorder_no_longer_has_are_found_with_the_rules_of_the_system_they_were_given() {
+        let root = std::env::temp_dir().join(format!("whisper-earlier-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let t0 = parse_time("2026-11-03T12:00:00-06:00").unwrap();
+        let rec = |tg: u32| CallRecord {
+            talkgroup: tg,
+            start_time: t0,
+            call_length: 5.0,
+            talkgroup_tag: "Plano PD".into(),
+            decrypted: true,
+            encrypted: true,
+            ..Default::default()
+        };
+        // The system is "sys" now; its calls were in "sys_800" and "sys_700" before the two were merged.
+        write_call(&root.join("sys_800/2026/11/3"), "3-100_1.0", &rec(3), true, false);
+        write_call(&root.join("sys_700/2026/11/3"), "3-101_2.0", &rec(3), true, false);
+        write_call(&root.join("sys_800/2026/11/3"), "21-100_1.0", &rec(21), true, false); // skipped by the system's rule
+        write_call(&root.join("elsewhere/2026/11/3"), "3-100_1.0", &rec(3), true, false); // not named: not searched
+        let earlier = [("sys_800".to_string(), "sys".to_string()), ("sys_700".to_string(), "sys".to_string()), ("ghost".to_string(), "nobody".to_string())];
+        let (found, _) = scan(&root, &plans(), &earlier, t0 - 3600, t0 + 3600, &[], 1.0);
+        let mut paths: Vec<&str> = found.iter().map(|e| e.call.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["sys_700/2026/11/3/3-101_2.0", "sys_800/2026/11/3/3-100_1.0"]);
+        // Their short names are the folders, so the two copies of one conversation still pair up.
+        assert_eq!(found.iter().map(|e| e.call.call.short_name.as_str()).collect::<std::collections::BTreeSet<_>>().len(), 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn it_finds_calls_in_range_that_the_rules_would_take_and_skips_the_rest() {
         let root = std::env::temp_dir().join(format!("whisper-backfill-{}", std::process::id()));
@@ -197,12 +262,12 @@ mod tests {
         let mut no_key = rec(8, t0, "Plano PD C");
         no_key.decrypted = false;
         write_call(&day, "8-100_1.0", &no_key, true, false); // encrypted, undecrypted
-        let (found, seen) = scan(&root, &plans(), t0 - 3600, t0 + 3600, &["plano".to_string()], 1.0);
+        let (found, seen) = scan(&root, &plans(), &[], t0 - 3600, t0 + 3600, &["plano".to_string()], 1.0);
         assert_eq!(found.iter().map(|e| e.call.path.as_str()).collect::<Vec<_>>(), vec!["sys/2026/11/3/3-100_1.0"]);
         assert_eq!(found[0].call.call.short_name, "sys");
         assert_eq!(seen.done_already, 1);
         // With no name filter the Allen call comes too.
-        let (all, _) = scan(&root, &plans(), t0 - 3600, t0 + 3600, &[], 1.0);
+        let (all, _) = scan(&root, &plans(), &[], t0 - 3600, t0 + 3600, &[], 1.0);
         assert_eq!(all.len(), 2);
         fs::remove_dir_all(&root).unwrap();
     }

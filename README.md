@@ -93,7 +93,9 @@ through them newest first. `backfill.only` limits them to talkgroups whose names
 
 Earlier and new calls wait in one list and the newest goes to a server next, so live traffic always comes first and
 the backlog fills in backwards from the present. Calls that already have a transcript are skipped, so leaving it set
-is harmless. `backfill.extraUrl` names a second server
+is harmless. `backfill.earlierFolders` lists folders of calls recorded under a name the recorder no longer has (a system that was
+renamed, or two merged into one), each with the system whose rules apply to it; calls under a system's current name
+need nothing. `backfill.extraUrl` names a second server
 (on the CPU, say) that takes the short earlier calls (`extraSeconds`, 12) at the same time. It never gets new calls.
 
 ## Running the servers

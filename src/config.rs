@@ -36,6 +36,21 @@ impl Default for Server {
     }
 }
 
+/// Earlier folder
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EarlierFolder {
+    /// Folder
+    ///
+    /// A folder of the recordings folder that holds calls from before a system was renamed or merged into another ("3BA_PAWMCO_800"). It's the name of the folder, not a path.
+    pub folder: String,
+    /// Use the rules of
+    ///
+    /// The system whose settings (its talkgroups and rules) apply to the calls in that folder.
+    #[schemars(extend("x-system" = true))]
+    pub system: String,
+}
+
 /// Earlier calls
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -48,6 +63,10 @@ pub struct Backfill {
     ///
     /// Limits the earlier calls to talkgroups whose name, description, group or category contains one of these words ("Plano PD, Plano FD"), separated by commas. The systems' rules still apply. Empty: every call they would transcribe.
     pub only: String,
+    /// Earlier folders
+    ///
+    /// Folders of calls recorded under a name the recorder no longer has (a system that was renamed, or merged with another). Each is searched with the rules of the system you name. Calls under a system's current name need nothing here.
+    pub earlier_folders: Vec<EarlierFolder>,
     /// Extra server for earlier calls
     ///
     /// Optional. The address of a second server (one running on the CPU, say) that works through earlier calls at the same time as the servers above, so they finish sooner. It never gets new calls. Start it with a short audio window (whisper-server -ac 640), like the "address for short calls" above.
@@ -59,7 +78,7 @@ pub struct Backfill {
 
 impl Default for Backfill {
     fn default() -> Self {
-        Backfill { from: String::new(), only: String::new(), extra_url: String::new(), extra_seconds: 12.0 }
+        Backfill { from: String::new(), only: String::new(), earlier_folders: Vec::new(), extra_url: String::new(), extra_seconds: 12.0 }
     }
 }
 

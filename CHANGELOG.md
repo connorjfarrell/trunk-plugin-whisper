@@ -13,6 +13,8 @@ Each version's section is its GitHub release notes.
   transcript is written beside both.
 - Calls are transcribed newest first: new and earlier calls wait in one list and the newest goes to a server next,
   so the latest calls get their words quickly however far behind the servers are.
+- The backfill can search folders of calls recorded under a name the recorder no longer has (a system renamed or
+  merged), with the rules of the system you name.
 - Earlier calls can be caught up on in the background, with an optional extra server working through the short
   ones beside the main one.
 - A server can split long calls: a call longer than its short-call length is cut at pauses into pieces of up to 12

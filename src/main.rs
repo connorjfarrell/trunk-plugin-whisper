@@ -48,6 +48,10 @@ struct Shared {
     servers: Vec<Server>,
     /// By system short name: its plan, and its vocabulary hint.
     systems: HashMap<String, (Plan, String)>,
+    /// Earlier folders: the system whose rules (and vocabulary hint) each follows.
+    aliases: HashMap<String, String>,
+    /// The vocabulary hint of a call whose system is gone and has no alias.
+    default_prompt: String,
     capture_dir: PathBuf,
     min_call_s: f64,
     give_up: Option<Duration>,
@@ -208,11 +212,12 @@ fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> At
 /// Find the calls recorded since `from` that have no transcript, and add them to the waiting list.
 #[allow(clippy::too_many_arguments)]
 fn run_backfill(from: i64, since: &str, only: &[String], shared: &Shared, waiting: &Waiting, host: &Host, stop: &mpsc::Receiver<()>) {
+    let earlier: Vec<(String, String)> = shared.aliases.iter().map(|(f, s)| (f.clone(), s.clone())).collect();
     // Live calls get the first minute to themselves.
     if !matches!(stop.recv_timeout(Duration::from_secs(30)), Err(RecvTimeoutError::Timeout)) {
         return;
     }
-    let (entries, seen) = backfill::scan(&shared.capture_dir, &shared.systems, from, unix_now(), only, shared.min_call_s);
+    let (entries, seen) = backfill::scan(&shared.capture_dir, &shared.systems, &earlier, from, unix_now(), only, shared.min_call_s);
     let groups = gather::pair_all(entries);
     host.info(format!(
         "backfill: {} conversation(s) to transcribe since {since}, behind the newer ones; {} calls already have one",
@@ -284,7 +289,8 @@ fn routed(shared: &Shared, group: &Group, backfill: bool, url: Option<&str>) -> 
     // A long call the server is set to split goes in pieces to its short-call address.
     let split = url.is_none() && server.split_long_calls && !server.short_url.trim().is_empty() && call.call.call_length > server.short_seconds;
     let url = if split { server.short_url.trim() } else { url.unwrap_or_else(|| pick_url(server, call.call.call_length)) };
-    let prompt = shared.systems.get(&call.call.short_name).map(|(_, p)| p.clone()).unwrap_or_default();
+    let system = shared.aliases.get(&call.call.short_name).unwrap_or(&call.call.short_name);
+    let prompt = shared.systems.get(system).map(|(_, p)| p.clone()).unwrap_or_else(|| shared.default_prompt.clone());
     call.call.extra.insert(
         ROUTE.into(),
         json!({ "url": url, "server": server.name.trim(), "prompt": prompt, "copies": group.copies, "backfill": backfill, "split": split }),
@@ -400,9 +406,23 @@ impl Plugin for Whisper {
             let prompt = plan.prompt.clone().unwrap_or_else(|| s.settings.prompt.trim().to_string());
             systems.insert(s.short_name.clone(), (plan, prompt));
         }
+        // Earlier folders: a name (never a path) and a system that transcribes.
+        let mut aliases = HashMap::new();
+        for f in &cfg.backfill.earlier_folders {
+            let (folder, system) = (f.folder.trim(), f.system.trim());
+            if folder.is_empty() || folder.contains(['/', '\\']) || folder == "." || folder == ".." {
+                return Err(format!("Earlier folder \"{folder}\": give the name of a folder in the recordings folder, not a path"));
+            }
+            if !systems.contains_key(system) {
+                return Err(format!("Earlier folder \"{folder}\": \"{system}\" isn't a system set to transcribe"));
+            }
+            aliases.insert(folder.to_string(), system.to_string());
+        }
         let shared = Arc::new(Shared {
             servers: cfg.servers.clone(),
             systems,
+            aliases,
+            default_prompt: cfg.prompt.trim().to_string(),
             capture_dir: setup.capture_dir.clone(),
             min_call_s: cfg.min_call_seconds,
             give_up: (cfg.give_up_minutes > 0.0).then(|| Duration::from_secs_f64(cfg.give_up_minutes * 60.0)),
@@ -628,6 +648,8 @@ mod tests {
         Shared {
             servers,
             systems: HashMap::new(),
+            aliases: HashMap::new(),
+            default_prompt: String::new(),
             capture_dir: dir.to_path_buf(),
             min_call_s: 1.0,
             give_up: None,
