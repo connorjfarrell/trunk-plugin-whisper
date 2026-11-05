@@ -83,14 +83,14 @@ pub struct Config {
     pub min_call_seconds: f64,
     /// Give up on calls waiting longer than (minutes)
     ///
-    /// If the servers fall behind, the oldest calls are dropped instead of being worked on hours late. 0: never.
+    /// Calls are transcribed newest first, so when the servers fall behind the oldest wait longest. This drops calls that have waited longer than this, instead of working on them hours late. 0: never.
     #[schemars(range(min = 0, max = 1440))]
     pub give_up_minutes: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { servers: Vec::new(), prompt: String::new(), backfill: Backfill::default(), one_at_a_time: true, min_call_seconds: 1.0, give_up_minutes: 120.0 }
+        Config { servers: Vec::new(), prompt: String::new(), backfill: Backfill::default(), one_at_a_time: true, min_call_seconds: 1.0, give_up_minutes: 0.0 }
     }
 }
 

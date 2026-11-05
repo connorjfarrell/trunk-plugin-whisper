@@ -17,4 +17,3 @@ start() { # name port model flags...
 }
 start whisper-small       8081 ggml-small.en.bin
 start whisper-turbo-short 8082 ggml-large-v3-turbo-q5_0.bin -ac 640
-start whisper-turbo-long  8083 ggml-large-v3-turbo-q5_0.bin

@@ -13,8 +13,8 @@ mod plan;
 mod wav;
 mod whisper;
 
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,12 @@ use whisper::{Client, Failure};
 
 /// How long a call waits for a twin from another system.
 const HOLD: Duration = Duration::from_secs(8);
+/// After the plugin starts, nothing is sent to a server for this long. A request the last run left in flight is
+/// still working on the server, and a second job on the same GPU at once can hang it (an Arc does).
+const START_QUIET: Duration = Duration::from_secs(45);
+/// Where the calls still waiting are saved when the plugin stops (the SDK queue's own file is `queue.jsonl`).
+const SAVED_WAITING: &str = "waiting.jsonl";
+const SAVED_QUEUE: &str = "queue.jsonl";
 /// The longest a server may take on one call.
 const SERVER_TIMEOUT: Duration = Duration::from_secs(120);
 /// The key in a queued call's extra fields that says where it goes.
@@ -46,6 +52,8 @@ struct Shared {
     transcribed: AtomicU64,
     /// The plugin is stopping: work in flight is let go, to be done next time.
     closing: AtomicBool,
+    /// No request goes to a server before this ([`START_QUIET`]).
+    quiet_until: Instant,
 }
 
 struct Whisper {
@@ -56,6 +64,8 @@ struct Whisper {
     backfill: Vec<JoinHandle<()>>,
     shared: Arc<Shared>,
     gather: Arc<Mutex<Gather>>,
+    waiting: Arc<Waiting>,
+    data_dir: PathBuf,
     queue: Arc<Mutex<CallQueue>>,
     stop: Option<Sender<()>>,
     worker: Option<JoinHandle<()>>,
@@ -131,6 +141,13 @@ fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> At
         Ok(a) => a,
         Err(e) => return Attempt::Fail(format!("{}: {e}", path.display())),
     };
+    // Let any request the last run left in flight finish before a new one is sent.
+    while Instant::now() < shared.quiet_until {
+        if shared.closing.load(Ordering::Relaxed) {
+            return Attempt::Retry("the plugin is stopping".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     // The request runs on a thread of its own so that stopping needn't wait for the server (a long call takes
     // it twenty seconds): the call is kept for next time and the answer, if it comes, is dropped.
     let (tx, rx) = mpsc::channel();
@@ -165,55 +182,30 @@ fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> At
     Attempt::Done { url: String::new() }
 }
 
-/// Catch up on earlier calls, newest first, one at a time and only when nothing newer is waiting.
+/// Find the calls recorded since `from` that have no transcript, and add them to the waiting list.
 #[allow(clippy::too_many_arguments)]
-fn run_backfill(
-    from: i64,
-    since: &str,
-    only: &[String],
-    shared: &Shared,
-    backlog: &Backlog,
-    gather: &Mutex<Gather>,
-    queue: &Mutex<CallQueue>,
-    host: &Host,
-    stop: &mpsc::Receiver<()>,
-) {
+fn run_backfill(from: i64, since: &str, only: &[String], shared: &Shared, waiting: &Waiting, host: &Host, stop: &mpsc::Receiver<()>) {
     // Live calls get the first minute to themselves.
     if !matches!(stop.recv_timeout(Duration::from_secs(30)), Err(RecvTimeoutError::Timeout)) {
         return;
     }
     let (entries, seen) = backfill::scan(&shared.capture_dir, &shared.systems, from, unix_now(), only, shared.min_call_s);
-    let mut groups = gather::pair_all(entries);
-    groups.sort_by_key(|g| std::cmp::Reverse(g.best.call.call.start_time_ms));
-    let total = groups.len();
-    host.info(format!("backfill: {total} conversation(s) to transcribe since {since}, newest first; {} calls already have one", seen.done_already));
-    *backlog.groups.lock().unwrap() = groups.into();
-    backlog.ready.store(true, Ordering::Release);
-    let mut told = Instant::now();
-    loop {
-        // New calls first: go on only when none is waiting, in the queue or for its twin.
-        loop {
-            if !matches!(stop.recv_timeout(Duration::from_millis(250)), Err(RecvTimeoutError::Timeout)) {
-                return;
-            }
-            if queue.lock().unwrap().is_empty() && gather.lock().unwrap().len() == 0 {
-                break;
-            }
-        }
-        let Some(group) = backlog.groups.lock().unwrap().pop_front() else { break };
-        enqueue(shared, queue, group, true);
-        if told.elapsed() >= Duration::from_secs(300) {
-            told = Instant::now();
-            host.info(format!("backfill: {} of {total} conversation(s) still to hand over", backlog.groups.lock().unwrap().len()));
-        }
+    let groups = gather::pair_all(entries);
+    host.info(format!(
+        "backfill: {} conversation(s) to transcribe since {since}, behind the newer ones; {} calls already have one",
+        groups.len(),
+        seen.done_already
+    ));
+    for group in groups {
+        waiting.add(group, true);
     }
-    host.info(format!("backfill: all {total} conversation(s) handed over"));
+    waiting.ready.store(true, Ordering::Release);
 }
 
 /// A second server, working through the short earlier calls beside the queue. It never touches new calls.
-fn run_extra(url: &str, up_to: f64, shared: &Shared, backlog: &Backlog, host: &Host, stopping: &AtomicBool) {
+fn run_extra(url: &str, up_to: f64, shared: &Shared, waiting: &Waiting, host: &Host, stopping: &AtomicBool) {
     let client = Client::new(SERVER_TIMEOUT);
-    while !backlog.ready.load(Ordering::Acquire) {
+    while !waiting.ready.load(Ordering::Acquire) {
         if stopping.load(Ordering::Relaxed) {
             return;
         }
@@ -221,17 +213,13 @@ fn run_extra(url: &str, up_to: f64, shared: &Shared, backlog: &Backlog, host: &H
     }
     let (mut failures, mut done) = (0, 0u64);
     while !stopping.load(Ordering::Relaxed) {
-        let group = {
-            let mut g = backlog.groups.lock().unwrap();
-            g.iter().position(|x| x.best.call.call.call_length <= up_to).and_then(|i| g.remove(i))
-        };
-        let Some(group) = group else { break };
-        match transcribe_call(shared, &client, &routed(shared, &group, true, Some(url))) {
+        let Some((key, item)) = waiting.pop_newest_earlier(up_to) else { break };
+        match transcribe_call(shared, &client, &routed(shared, &item.group, true, Some(url))) {
             Attempt::Done { .. } => {
                 (failures, done) = (0, done + 1);
             }
             Attempt::Retry(why) => {
-                backlog.groups.lock().unwrap().push_front(group);
+                waiting.put_back(key, item);
                 failures += 1;
                 if failures >= 5 {
                     host.warn(format!("backfill: the extra server isn't answering ({why}); it has stopped"));
@@ -281,11 +269,86 @@ fn enqueue(shared: &Shared, queue: &Mutex<CallQueue>, group: Group, backfill: bo
     queue.lock().unwrap().push(routed(shared, &group, backfill, None));
 }
 
-/// Earlier calls to catch up on, once they've been found.
+/// A call waiting for a server.
+struct Item {
+    group: Group,
+    /// An earlier call (found by the backfill), not one the recorder just told of.
+    backfill: bool,
+}
+
+/// Calls waiting for a server, newest first: the one handed over next is always the newest left, so the latest
+/// calls are transcribed within a minute or two however far behind the servers are, and the backlog fills in
+/// behind them. New calls and earlier ones (a backfill) wait together.
 #[derive(Default)]
-struct Backlog {
-    groups: Mutex<VecDeque<Group>>,
+struct Waiting {
+    /// By start time (ms), then order of arrival.
+    items: Mutex<BTreeMap<(i64, u64), Item>>,
+    seq: AtomicU64,
+    /// The backfill has added the calls it found.
     ready: AtomicBool,
+}
+
+impl Waiting {
+    fn add(&self, group: Group, backfill: bool) {
+        let key = (group.best.call.call.start_time_ms, self.seq.fetch_add(1, Ordering::Relaxed));
+        self.items.lock().unwrap().insert(key, Item { group, backfill });
+    }
+
+    fn put_back(&self, key: (i64, u64), item: Item) {
+        self.items.lock().unwrap().insert(key, item);
+    }
+
+    fn pop_newest(&self) -> Option<Item> {
+        self.items.lock().unwrap().pop_last().map(|(_, i)| i)
+    }
+
+    /// The newest earlier call that is `up_to` seconds long or less.
+    fn pop_newest_earlier(&self, up_to: f64) -> Option<((i64, u64), Item)> {
+        let mut g = self.items.lock().unwrap();
+        let key = g.iter().rev().find(|(_, i)| i.backfill && i.group.best.call.call.call_length <= up_to).map(|(k, _)| *k)?;
+        g.remove(&key).map(|i| (key, i))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.items.lock().unwrap().len()
+    }
+
+    /// (new calls, earlier ones) waiting.
+    fn counts(&self) -> (usize, usize) {
+        let g = self.items.lock().unwrap();
+        let earlier = g.values().filter(|i| i.backfill).count();
+        (g.len() - earlier, earlier)
+    }
+
+    /// The new calls still waiting (the earlier ones are found again by the next backfill).
+    fn take_new(&self) -> Vec<Group> {
+        let mut g = self.items.lock().unwrap();
+        let keys: Vec<_> = g.iter().filter(|(_, i)| !i.backfill).map(|(k, _)| *k).collect();
+        keys.into_iter().filter_map(|k| g.remove(&k)).map(|i| i.group).collect()
+    }
+}
+
+/// Calls saved by an earlier run, one call JSON a line (the format the SDK's queue saves in): those whose audio is still there.
+fn read_saved(path: &Path) -> Vec<ConcludedCall> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    text.lines().filter_map(|l| serde_json::from_str::<ConcludedCall>(l).ok()).filter(|c| c.files.wav.exists()).collect()
+}
+
+fn save_calls(path: &Path, calls: &[ConcludedCall]) -> std::io::Result<()> {
+    let mut text = String::new();
+    for c in calls {
+        text.push_str(&serde_json::to_string(c).unwrap_or_default());
+        text.push('\n');
+    }
+    std::fs::write(path, text)
+}
+
+/// A saved call as a group again: its server and the copies it stands for were written on it ([`routed`]).
+fn group_from_call(call: ConcludedCall, servers: &[Server]) -> Option<(Group, bool)> {
+    let r = route(&call)?;
+    let server = servers.iter().position(|s| s.name.trim().eq_ignore_ascii_case(&r.server)).unwrap_or(0);
+    Some((Group { best: Entry { arrived: Instant::now(), call, server }, copies: r.copies }, r.backfill))
 }
 
 impl Plugin for Whisper {
@@ -317,6 +380,7 @@ impl Plugin for Whisper {
             give_up: (cfg.give_up_minutes > 0.0).then(|| Duration::from_secs_f64(cfg.give_up_minutes * 60.0)),
             transcribed: AtomicU64::new(0),
             closing: AtomicBool::new(false),
+            quiet_until: Instant::now() + START_QUIET,
         });
         if shared.systems.is_empty() {
             host.status(State::Warning, "No system is set to transcribe. Turn it on in a system's settings.");
@@ -327,6 +391,24 @@ impl Plugin for Whisper {
                 State::Ok,
                 format!("Transcribing {} with {}", names.join(", "), cfg.servers.iter().map(|s| s.name.trim()).collect::<Vec<_>>().join(", ")),
             );
+        }
+
+        let waiting = Arc::new(Waiting::default());
+        // What an earlier run left (in its own list, or in the SDK queue's, as the first version of this plugin did)
+        // joins the list, so the newest of it goes first with the rest, and the queue starts empty.
+        let mut revived = 0;
+        for name in [SAVED_WAITING, SAVED_QUEUE] {
+            let path = setup.data_dir.join(name);
+            for call in read_saved(&path) {
+                if let Some((group, backfill)) = group_from_call(call, &shared.servers) {
+                    waiting.add(group, backfill);
+                    revived += 1;
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        if revived > 0 {
+            host.info(format!("{revived} call(s) left from last time, to be transcribed newest first"));
         }
 
         let client = Arc::new(Client::new(SERVER_TIMEOUT));
@@ -350,7 +432,6 @@ impl Plugin for Whisper {
             t => Some(backfill::parse_time(t).map_err(|e| format!("Transcribe calls since: {e}"))?),
         };
         let (backfill_stop, bf_rx) = mpsc::channel::<()>();
-        let backlog = Arc::new(Backlog::default());
         let stopping = Arc::new(AtomicBool::new(false));
         let extra_url = cfg.backfill.extra_url.trim().to_string();
         if !extra_url.is_empty() && !(extra_url.starts_with("http://") || extra_url.starts_with("https://")) {
@@ -358,52 +439,72 @@ impl Plugin for Whisper {
         }
         let mut backfill = Vec::new();
         if let Some(from) = backfill_from.filter(|_| !shared.systems.is_empty()) {
-            let (b, g, q, sh, h) = (backlog.clone(), gather.clone(), queue.clone(), shared.clone(), host.clone());
+            let (w, sh, h) = (waiting.clone(), shared.clone(), host.clone());
             let (only, since) = (plan::words(&cfg.backfill.only), cfg.backfill.from.trim().to_string());
             backfill.push(
                 std::thread::Builder::new()
                     .name("whisper-backfill".into())
-                    .spawn(move || run_backfill(from, &since, &only, &sh, &b, &g, &q, &h, &bf_rx))
+                    .spawn(move || run_backfill(from, &since, &only, &sh, &w, &h, &bf_rx))
                     .map_err(|e| format!("can't start the backfill: {e}"))?,
             );
             if !extra_url.is_empty() {
-                let (b, sh, h, st, up_to) = (backlog.clone(), shared.clone(), host.clone(), stopping.clone(), cfg.backfill.extra_seconds);
+                let (w, sh, h, st, up_to) = (waiting.clone(), shared.clone(), host.clone(), stopping.clone(), cfg.backfill.extra_seconds);
                 backfill.push(
                     std::thread::Builder::new()
                         .name("whisper-extra".into())
-                        .spawn(move || run_extra(&extra_url, up_to, &sh, &b, &h, &st))
+                        .spawn(move || run_extra(&extra_url, up_to, &sh, &w, &h, &st))
                         .map_err(|e| format!("can't start the extra server's worker: {e}"))?,
                 );
             }
         }
 
         let (stop, rx) = mpsc::channel::<()>();
-        let (g, q, sh, h) = (gather.clone(), queue.clone(), shared.clone(), host.clone());
+        let (g, q, w, sh, h) = (gather.clone(), queue.clone(), waiting.clone(), shared.clone(), host.clone());
         let worker = std::thread::Builder::new()
             .name("whisper-gather".into())
             .spawn(move || {
                 let (mut last, mut told) = (0, Instant::now());
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(500)) {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
                         Err(RecvTimeoutError::Timeout) => {}
                         _ => return,
                     }
                     let ready = g.lock().unwrap().take_ready(Instant::now(), HOLD);
                     for group in ready {
-                        enqueue(&sh, &q, group, false);
+                        w.add(group, false);
+                    }
+                    // The queue gets the newest call waiting whenever it has room: one working, one next.
+                    while q.lock().unwrap().len() < 2 {
+                        let Some(item) = w.pop_newest() else { break };
+                        enqueue(&sh, &q, item.group, item.backfill);
                     }
                     if told.elapsed() >= Duration::from_secs(300) {
                         told = Instant::now();
                         let done = sh.transcribed.load(Ordering::Relaxed);
                         if done > last {
-                            h.info(format!("transcribed {} call(s) in the last five minutes; {} waiting", done - last, q.lock().unwrap().len()));
+                            {
+                                let (new, earlier) = w.counts();
+                                h.info(format!("transcribed {} call(s) in the last five minutes; waiting: {new} new, {earlier} earlier", done - last));
+                            }
                             last = done;
                         }
                     }
                 }
             })
             .map_err(|e| format!("can't start the worker: {e}"))?;
-        Ok(Whisper { host, backfill_stop: Some(backfill_stop), stopping, backfill, shared, gather, queue, stop: Some(stop), worker: Some(worker) })
+        Ok(Whisper {
+            host,
+            backfill_stop: Some(backfill_stop),
+            stopping,
+            backfill,
+            shared,
+            gather,
+            waiting,
+            data_dir: setup.data_dir.clone(),
+            queue,
+            stop: Some(stop),
+            worker: Some(worker),
+        })
     }
 
     fn call_concluded(&mut self, call: ConcludedCall) {
@@ -430,9 +531,13 @@ impl Plugin for Whisper {
             join_within(w, (grace / 4).min(Duration::from_secs(1)));
         }
         // Calls still waiting for a twin go to the queue, which saves what it hasn't done.
-        let waiting = self.gather.lock().unwrap().drain();
-        for group in waiting {
-            enqueue(&self.shared, &self.queue, group, false);
+        let groups: Vec<Group> = self.gather.lock().unwrap().drain().into_iter().chain(self.waiting.take_new()).collect();
+        if !groups.is_empty() {
+            let calls: Vec<ConcludedCall> = groups.iter().map(|g| routed(&self.shared, g, false, None)).collect();
+            match save_calls(&self.data_dir.join(SAVED_WAITING), &calls) {
+                Ok(()) => self.host.info(format!("{} waiting call(s) saved for next time", calls.len())),
+                Err(e) => self.host.error(format!("couldn't save {} waiting call(s): {e}", calls.len())),
+            }
         }
         // In-flight requests are let go at once (`closing`), so the queue needs little time to save what's left.
         self.queue.lock().unwrap().shutdown(grace.min(Duration::from_secs(3)));
@@ -500,6 +605,7 @@ mod tests {
             give_up: None,
             transcribed: AtomicU64::new(0),
             closing: AtomicBool::new(false),
+            quiet_until: Instant::now(),
         }
     }
 
@@ -548,6 +654,42 @@ mod tests {
         let mut s = shared(&dir, vec![]);
         s.give_up = Some(Duration::from_secs(3600));
         assert!(matches!(transcribe_call(&s, &Client::new(Duration::from_secs(2)), &late), Attempt::Skip(m) if m.contains("minutes")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn waiting_calls_are_saved_and_come_back_as_groups_with_their_server_and_copies() {
+        let dir = temp("saved");
+        let servers = vec![
+            Server { name: "fast".into(), url: "http://a/inference".into(), ..Default::default() },
+            Server { name: "accurate".into(), url: "http://b/inference".into(), ..Default::default() },
+        ];
+        let s = shared(&dir, servers.clone());
+        let mut c = call(&dir, "sys/a/5-1_1.0", "", &[], 0);
+        c.call.call_length = 3.0;
+        let group = Group { best: Entry { arrived: Instant::now(), call: c, server: 1 }, copies: vec!["other/x/5-1_2.0".into()] };
+        let path = dir.join(SAVED_WAITING);
+        save_calls(&path, &[routed(&s, &group, false, None)]).unwrap();
+        let back = read_saved(&path);
+        assert_eq!(back.len(), 1);
+        let (g, backfill) = group_from_call(back.into_iter().next().unwrap(), &servers).unwrap();
+        assert_eq!((g.best.server, g.copies, backfill), (1, vec!["other/x/5-1_2.0".to_string()], false));
+        // A call whose audio is gone isn't brought back.
+        std::fs::remove_file(dir.join("sys/a/5-1_1.0.wav")).unwrap();
+        assert!(read_saved(&path).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nothing_is_sent_to_a_server_during_the_quiet_period_after_a_start() {
+        let dir = temp("quiet");
+        let url = server(1, ANSWER);
+        let c = call(&dir, "sys/a/5-1_1.0", &url, &[], 0);
+        let mut s = shared(&dir, vec![]);
+        s.quiet_until = Instant::now() + Duration::from_millis(1500);
+        let started = Instant::now();
+        assert!(matches!(transcribe_call(&s, &Client::new(Duration::from_secs(5)), &c), Attempt::Done { .. }));
+        assert!(started.elapsed() >= Duration::from_millis(1400), "sent after only {:?}", started.elapsed());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -613,14 +755,42 @@ mod tests {
             c.call.call_length = len;
             Group { best: Entry { arrived: Instant::now(), call: c, server: 0 }, copies: vec![] }
         };
-        let backlog = Backlog::default();
-        *backlog.groups.lock().unwrap() = VecDeque::from(vec![group("sys/a/5-1_1.0", 4.0), group("sys/a/5-2_1.0", 30.0), group("sys/a/5-3_1.0", 9.0)]);
-        backlog.ready.store(true, Ordering::Release);
-        run_extra(&url, 12.0, &s, &backlog, &Host::to_writer(std::io::sink()), &AtomicBool::new(false));
+        let waiting = Waiting::default();
+        for (path, len) in [("sys/a/5-1_1.0", 4.0), ("sys/a/5-2_1.0", 30.0), ("sys/a/5-3_1.0", 9.0)] {
+            waiting.add(group(path, len), true);
+        }
+        waiting.ready.store(true, Ordering::Release);
+        run_extra(&url, 12.0, &s, &waiting, &Host::to_writer(std::io::sink()), &AtomicBool::new(false));
         // The two short calls are done, with the server's words; the long one is still waiting for the GPU.
         assert!(dir.join("sys/a/5-1_1.0.transcript.json").exists() && dir.join("sys/a/5-3_1.0.transcript.json").exists());
         assert!(!dir.join("sys/a/5-2_1.0.transcript.json").exists());
-        assert_eq!(backlog.groups.lock().unwrap().len(), 1);
+        assert_eq!(waiting.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_newest_waiting_call_is_handed_over_first_and_new_calls_are_kept_at_stop() {
+        let dir = temp("order");
+        let waiting = Waiting::default();
+        let group = |start_ms: i64, len: f64| {
+            let mut c = call(&dir, &format!("sys/a/5-{start_ms}_1.0"), "", &[], 0);
+            c.call.start_time_ms = start_ms;
+            c.call.call_length = len;
+            Group { best: Entry { arrived: Instant::now(), call: c, server: 0 }, copies: vec![] }
+        };
+        waiting.add(group(1000, 3.0), false); // a new call, oldest
+        waiting.add(group(5000, 3.0), true); // earlier calls, newer in time
+        waiting.add(group(3000, 30.0), true);
+        waiting.add(group(4000, 3.0), false);
+        // The newest first, whether it is new or earlier.
+        assert_eq!(waiting.pop_newest().unwrap().group.best.call.call.start_time_ms, 5000);
+        // The extra server takes only earlier, short calls: not the 4000 (new) and not the 3000 (long).
+        assert!(waiting.pop_newest_earlier(12.0).is_none());
+        // What's left of the new calls is kept for the queue to save at stop; earlier ones are dropped.
+        let kept: Vec<i64> = waiting.take_new().iter().map(|g| g.best.call.call.start_time_ms).collect();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&1000) && kept.contains(&4000));
+        assert_eq!(waiting.len(), 1, "the earlier 3000 call stays");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

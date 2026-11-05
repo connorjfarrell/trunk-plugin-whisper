@@ -1,5 +1,5 @@
 #!/bin/bash
-# Starts the Whisper servers the plugin talks to, as Docker containers that restart with the machine.
+# Starts the Whisper servers the plugin talks to (no full-window large model: see the README on GPU hangs), as Docker containers that restart with the machine.
 # They listen on the loopback only. The image is built from server/Dockerfile (whisper.cpp with Vulkan).
 # usage: run.sh [models-dir]
 set -euo pipefail
@@ -20,7 +20,6 @@ start() { # name port model [extra server flags]
 
 start whisper-small       8081 ggml-small.en.bin
 start whisper-turbo-short 8082 ggml-large-v3-turbo-q5_0.bin -ac 640
-start whisper-turbo-long  8083 ggml-large-v3-turbo-q5_0.bin
 
 # Optional: a CPU copy of the turbo model, short window, for the plugin's backfill (EXTRA_CPU_CORES=6 ./run.sh).
 # At low priority, so whatever else the machine does (a recorder) wins.

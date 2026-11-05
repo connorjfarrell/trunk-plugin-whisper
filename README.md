@@ -11,9 +11,9 @@ sends each call's audio to a Whisper server you run, so the GPU or CPU work happ
 ## What you need
 
 A Whisper server that speaks whisper.cpp's `/inference` API (`whisper-server`). `server/` has a Dockerfile and a
-script that start three of them on one GPU (Vulkan, so Intel Arc and AMD work as well as NVIDIA): a small model
-for most talkgroups, and the large-v3-turbo model twice, once with a short audio window for short calls and once
-with the full window. See [Running the servers](#running-the-servers).
+script that start two of them on one GPU (Vulkan, so Intel Arc and AMD work as well as NVIDIA): a small model
+(full audio window) for most talkgroups and for long calls, and the large-v3-turbo model with a short audio window
+for short calls. See [Running the servers](#running-the-servers).
 
 ## Settings
 
@@ -25,7 +25,7 @@ In the plugin's settings:
 | Vocabulary hint | `prompt` | A sentence of words to expect ("Police and fire dispatch radio traffic in Collin County, Texas: …"). Helps names and jargon. A system can use its own. |
 | One server at a time | `oneAtATime` | On by default: calls go to the servers one at a time. Keep it on when they share a GPU, because two at once can hang it. |
 | Shortest call to transcribe | `minCallSeconds` | Shorter calls are mostly a key-up. |
-| Give up on calls waiting longer than | `giveUpMinutes` | If the servers fall behind, the oldest calls are dropped. `0`: never. |
+| Give up on calls waiting longer than | `giveUpMinutes` | Calls are transcribed newest first, so when the servers fall behind the oldest wait longest; this drops calls that have waited longer than this. `0` (the default): never. |
 | Earlier calls | `backfill` | See [Earlier calls](#earlier-calls). |
 
 In each system's settings:
@@ -46,7 +46,7 @@ dispatch to the accurate server, and everything else to the fast one:
   "plugins": { "whisper": { "enabled": true, "path": "/opt/trunk-pro/plugins/whisper", "shareDecrypted": true,
     "settings": { "servers": [
       { "name": "fast", "url": "http://127.0.0.1:8081/inference" },
-      { "name": "accurate", "url": "http://127.0.0.1:8083/inference", "shortUrl": "http://127.0.0.1:8082/inference" } ] } } },
+      { "name": "accurate", "url": "http://127.0.0.1:8081/inference", "shortUrl": "http://127.0.0.1:8082/inference" } ] } } },
   "systems": [ { "shortName": "pawmco", "plugins": { "whisper": { "transcribe": true, "tier": "fast", "rules": [
       { "talkgroups": ["21", "24", "25", "112-113"], "tier": "skip" },
       { "text": "Plano PD, Plano FD", "tier": "accurate" },
@@ -73,6 +73,11 @@ were never encrypted. Calls that couldn't be decrypted are never transcribed.
 `copy_of` names the other system's copy that was transcribed, when this call was the second recording of the
 same conversation. `repeated: true` means a phrase came out three or more times in a row and was cut to one.
 
+## Newest first
+
+When the servers are behind, the call handed over next is always the newest one waiting, so the latest calls get
+their words within a minute or two and the backlog fills in behind them, backwards in time.
+
 ## Two systems, one conversation
 
 A network heard on two bands, or by two sites, records the same call twice. Calls wait about eight seconds for
@@ -86,14 +91,15 @@ beside both.
 it finds the calls since then that have no transcript and that the systems' rules would transcribe, and works
 through them newest first. `backfill.only` limits them to talkgroups whose names contain one of some words.
 
-They go to the servers only when no new call is waiting, so live traffic always comes first, and calls that
-already have a transcript are skipped, so leaving it set is harmless. `backfill.extraUrl` names a second server
+Earlier and new calls wait in one list and the newest goes to a server next, so live traffic always comes first and
+the backlog fills in backwards from the present. Calls that already have a transcript are skipped, so leaving it set
+is harmless. `backfill.extraUrl` names a second server
 (on the CPU, say) that takes the short earlier calls (`extraSeconds`, 12) at the same time. It never gets new calls.
 
 ## Running the servers
 
 `server/Dockerfile` builds whisper.cpp with Vulkan. `server/run.sh` starts the three containers on the loopback
-(`8081` small.en, `8082` large-v3-turbo with `-ac 640`, `8083` large-v3-turbo), with the silence filter (VAD) on,
+(`8081` small.en, `8082` large-v3-turbo with `-ac 640`), with the silence filter (VAD) on,
 which Whisper needs to avoid inventing words in the gaps. `EXTRA_CPU_CORES=6 ./run.sh` also starts a CPU copy on
 `8084`, for the plugin's `backfill.extraUrl`.
 
@@ -112,14 +118,22 @@ What I measured on an Intel Arc A310 (4 GB) with 8 short calls (55 s of audio), 
 |---|---|---|
 | small.en | no | 2.4 s a call |
 | large-v3-turbo (q5) | `-ac 640` | 4 s a call |
-| large-v3-turbo (q5) | no | 11 s a call |
+| large-v3-turbo (q5) | no | 11 s a call (**don't run it on an Arc: see below**) |
 
 `-ac 640` makes the encoder work on about 13 seconds of audio instead of 30, which is why calls up to that
 length can have a server of their own. The same turbo model on six CPU cores took 6 to 8 s a call.
 
 Two things to know. Whisper sometimes hears words in noise and tones: the plugin cuts out loops, but a call that
-is only a tone can still come out as a short phrase. And an Arc GPU that is given two servers' work at once can
-hang and reset (the server dies and restarts); that is what **One server at a time** is for.
+is only a tone can still come out as a short phrase.
+
+And **an Arc GPU resets if one job runs longer than about 7.5 seconds** (the Linux i915 driver's preempt timeout).
+A large model with the full 30-second audio window takes about 9 seconds for one encoder pass, so every long call
+sent to it hung the GPU ("GPU HANG … context reset" in `dmesg`), killing the request and sometimes the server.
+Short-window servers (`-ac 640`, about 3 s a pass) and small.en ran for hours without a problem. So on this kind of
+GPU give a large model only the short window, and send long calls to a smaller model with the full window (the
+`accurate` server's address, as in the example above). Starting several servers at once, or sending two servers
+work at once, makes it worse; **One server at a time** and a 45-second quiet period after the plugin starts are
+for that.
 
 ## Using the transcripts
 

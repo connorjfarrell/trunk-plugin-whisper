@@ -89,6 +89,7 @@ impl Gather {
         self.pending.push(entry);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.pending.len()
     }
