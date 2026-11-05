@@ -24,11 +24,15 @@ pub struct Server {
     /// Short calls are up to (seconds)
     #[schemars(range(min = 1, max = 30))]
     pub short_seconds: f64,
+    /// Split long calls
+    ///
+    /// Instead of sending a call longer than that to the address above, cut it at pauses into pieces that fit the short window, send each to the address for short calls, and join the words. It keeps every job short, which a large model on a small GPU needs (an Arc GPU resets on any job over about 7.5 seconds). Needs an address for short calls.
+    pub split_long_calls: bool,
 }
 
 impl Default for Server {
     fn default() -> Self {
-        Server { name: String::new(), url: String::new(), short_url: String::new(), short_seconds: 12.0 }
+        Server { name: String::new(), url: String::new(), short_url: String::new(), short_seconds: 12.0, split_long_calls: false }
     }
 }
 

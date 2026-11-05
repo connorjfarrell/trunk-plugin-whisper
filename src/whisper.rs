@@ -52,6 +52,25 @@ fn collapse<T: Clone>(items: &[T], key: impl Fn(&T) -> String) -> (Vec<T>, bool)
     (out, cut)
 }
 
+impl Transcript {
+    /// The transcripts of a call's pieces as one: each piece's segments moved to where it starts (`offset`, seconds).
+    pub fn join(parts: Vec<(f64, Transcript)>) -> Transcript {
+        let mut out = Transcript::default();
+        for (offset, t) in parts {
+            if out.language.is_empty() {
+                out.language = t.language.clone();
+            }
+            out.duration = out.duration.max(offset + t.duration);
+            out.repeated |= t.repeated;
+            out.segments.extend(t.segments.into_iter().map(|s| Segment { start: s.start + offset, end: s.end + offset, text: s.text }));
+        }
+        let (text, cut) = collapse_sentences(&out.segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" "));
+        out.text = text;
+        out.repeated |= cut;
+        out
+    }
+}
+
 /// The text with any sentence repeated three or more times in a row cut to one.
 fn collapse_sentences(text: &str) -> (String, bool) {
     let mut sentences = Vec::new();
@@ -231,6 +250,24 @@ mod tests {
             parse(r#"{"segments":[{"start":0,"end":1,"text":" Ten-four."},{"start":1,"end":2,"text":" Ten-four."},{"start":2,"end":3,"text":" Go."}]}"#)
                 .unwrap();
         assert_eq!((twice.text.as_str(), twice.segments.len(), twice.repeated), ("Ten-four. Ten-four. Go.", 3, false));
+    }
+
+    #[test]
+    fn the_pieces_of_a_long_call_join_in_order_with_their_times_and_a_loop_across_a_cut_is_cut() {
+        let piece = |text: &str, end: f64| Transcript {
+            text: text.into(),
+            segments: vec![Segment { start: 0.5, end, text: text.into() }],
+            language: "en".into(),
+            duration: end,
+            repeated: false,
+        };
+        let joined = Transcript::join(vec![(0.0, piece("Go ahead.", 3.0)), (11.0, piece("Show us the route.", 4.0)), (22.5, piece("Copy.", 1.5))]);
+        assert_eq!(joined.text, "Go ahead. Show us the route. Copy.");
+        let starts: Vec<f64> = joined.segments.iter().map(|s| s.start).collect();
+        assert_eq!(starts, vec![0.5, 11.5, 23.0]);
+        assert_eq!((joined.duration, joined.language.as_str(), joined.repeated), (24.0, "en", false));
+        let looped = Transcript::join(vec![(0.0, piece("The 4th.", 2.0)), (10.0, piece("The 4th.", 2.0)), (20.0, piece("The 4th.", 2.0))]);
+        assert_eq!((looped.text.as_str(), looped.repeated), ("The 4th.", true));
     }
 
     #[test]

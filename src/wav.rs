@@ -112,13 +112,65 @@ pub fn write(samples: &[i16], rate: u32) -> Vec<u8> {
     w
 }
 
-/// What goes to the server: the recorder's WAV, at 16 kHz.
-pub fn for_whisper(wav: &[u8]) -> Result<Vec<u8>, String> {
+/// Where to cut `samples` into pieces of at most `max_s` seconds: at the last pause (a stretch of at least 160 ms
+/// much quieter than the speech) before the limit, else at the limit. Pieces are `(start, end)` sample numbers; any
+/// piece under 0.3 s is dropped (nothing was said in it).
+pub fn split_at_pauses(samples: &[i16], rate: u32, max_s: f64) -> Vec<(usize, usize)> {
+    let frame = (rate / 50).max(1) as usize; // 20 ms
+    let rms: Vec<f64> = samples.chunks(frame).map(|c| (c.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / c.len() as f64).sqrt()).collect();
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let loud = sorted.get(sorted.len() * 9 / 10).copied().unwrap_or(0.0);
+    let quiet_below = (0.2 * loud).max(50.0);
+    // The middle of each run of quiet frames at least 160 ms long, as a sample number.
+    let mut pauses = Vec::new();
+    let mut i = 0;
+    while i < rms.len() {
+        if rms[i] < quiet_below {
+            let start = i;
+            while i < rms.len() && rms[i] < quiet_below {
+                i += 1;
+            }
+            if i - start >= 8 {
+                pauses.push((start + i) / 2 * frame);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let (max_len, min_len) = ((max_s * rate as f64) as usize, 3 * rate as usize);
+    let (mut pieces, mut pos) = (Vec::new(), 0);
+    while pos < samples.len() {
+        if samples.len() - pos <= max_len {
+            pieces.push((pos, samples.len()));
+            break;
+        }
+        let cut = pauses.iter().copied().filter(|&p| p > pos + min_len && p <= pos + max_len).max().unwrap_or(pos + max_len);
+        pieces.push((pos, cut));
+        pos = cut;
+    }
+    pieces.retain(|&(a, b)| (b - a) as f64 >= 0.3 * rate as f64);
+    pieces
+}
+
+/// What goes to the server: the recorder's WAV, at 16 kHz, whole (`split_s` `None`) or cut into pieces of at most
+/// `split_s` seconds at pauses. Each piece comes with where it starts, in seconds.
+pub fn pieces_for_whisper(wav: &[u8], split_s: Option<f64>) -> Result<Vec<(f64, Vec<u8>)>, String> {
     let (samples, rate) = read(wav)?;
     if samples.is_empty() {
         return Err("the WAV has no audio".into());
     }
-    Ok(write(&to_16k(&samples, rate), TARGET))
+    let up = to_16k(&samples, rate);
+    match split_s {
+        None => Ok(vec![(0.0, write(&up, TARGET))]),
+        Some(max) => {
+            let pieces = split_at_pauses(&up, TARGET, max);
+            if pieces.is_empty() {
+                return Err("the WAV has no audio".into());
+            }
+            Ok(pieces.into_iter().map(|(a, b)| (a as f64 / TARGET as f64, write(&up[a..b], TARGET))).collect())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +219,58 @@ mod tests {
         let mut stereo = write(&[0; 8], 8000);
         stereo[22] = 2;
         assert!(read(&stereo).unwrap_err().contains("2 channel"));
-        assert!(for_whisper(&write(&[], 8000)).is_err());
+        assert!(pieces_for_whisper(&write(&[], 8000), None).is_err());
+    }
+
+    /// Speech-like bursts (a tone, loud) with pauses (near silence) between, `secs` long altogether.
+    fn bursts(burst_s: f64, pause_s: f64, secs: f64) -> Vec<i16> {
+        let rate = 16000.0;
+        let mut out = Vec::new();
+        while (out.len() as f64) < secs * rate {
+            out.extend(tone(300.0, 16000, (burst_s * rate) as usize));
+            out.extend(std::iter::repeat_n(3i16, (pause_s * rate) as usize));
+        }
+        out.truncate((secs * rate) as usize);
+        out
+    }
+
+    #[test]
+    fn a_long_call_is_cut_at_pauses_into_pieces_that_fit_and_nothing_is_lost() {
+        let s = bursts(2.5, 0.4, 30.0);
+        let pieces = split_at_pauses(&s, 16000, 12.0);
+        assert!(pieces.len() >= 3, "{pieces:?}");
+        let mut at = 0;
+        for &(a, b) in &pieces {
+            assert_eq!(a, at, "pieces are back to back");
+            assert!((b - a) as f64 <= 12.0 * 16000.0, "a piece is {} s", (b - a) as f64 / 16000.0);
+            at = b;
+        }
+        assert_eq!(at, s.len());
+        // Each cut lands in a pause, not in the middle of a burst.
+        for &(_, b) in &pieces[..pieces.len() - 1] {
+            assert!(s[b].abs() <= 3, "cut at {b} is inside a burst");
+        }
+    }
+
+    #[test]
+    fn a_short_call_is_one_piece_and_continuous_sound_is_cut_at_the_limit() {
+        let one = bursts(2.5, 0.4, 8.0);
+        assert_eq!(split_at_pauses(&one, 16000, 12.0), vec![(0, one.len())]);
+        let steady = tone(300.0, 16000, 30 * 16000);
+        let pieces = split_at_pauses(&steady, 16000, 12.0);
+        assert_eq!(pieces, vec![(0, 192_000), (192_000, 384_000), (384_000, 480_000)]);
+    }
+
+    #[test]
+    fn pieces_come_with_their_start_times_and_a_sliver_is_dropped() {
+        let wav = write(&bursts(2.5, 0.4, 20.0).iter().step_by(2).copied().collect::<Vec<_>>(), 8000);
+        let whole = pieces_for_whisper(&wav, None).unwrap();
+        assert_eq!((whole.len(), whole[0].0), (1, 0.0));
+        let cut = pieces_for_whisper(&wav, Some(12.0)).unwrap();
+        assert!(cut.len() >= 2 && cut[0].0 == 0.0 && cut[1].0 > 3.0 && cut[1].0 <= 12.0, "{:?}", cut.iter().map(|p| p.0).collect::<Vec<_>>());
+        // 12.1 s of sound at a 12 s limit: the 0.1 s left over is not sent.
+        let steady = write(&tone(300.0, 8000, (12.1 * 8000.0) as usize), 8000);
+        assert_eq!(pieces_for_whisper(&steady, Some(12.0)).unwrap().len(), 1);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use trunk_recorder_plugin::{Attempt, CallQueue, ConcludedCall, Host, Manifest, P
 use config::{Config, Server, SystemConfig};
 use gather::{Entry, Gather, Group};
 use plan::{Choice, Plan};
-use whisper::{Client, Failure};
+use whisper::{Client, Failure, Transcript};
 
 /// How long a call waits for a twin from another system.
 const HOLD: Duration = Duration::from_secs(8);
@@ -37,6 +37,8 @@ const START_QUIET: Duration = Duration::from_secs(45);
 /// Where the calls still waiting are saved when the plugin stops (the SDK queue's own file is `queue.jsonl`).
 const SAVED_WAITING: &str = "waiting.jsonl";
 const SAVED_QUEUE: &str = "queue.jsonl";
+/// The longest piece a long call is cut into: what a short-window server (`-ac 640`, 12.8 s) can take.
+const PIECE_SECONDS: f64 = 12.0;
 /// The longest a server may take on one call.
 const SERVER_TIMEOUT: Duration = Duration::from_secs(120);
 /// The key in a queued call's extra fields that says where it goes.
@@ -51,7 +53,7 @@ struct Shared {
     give_up: Option<Duration>,
     transcribed: AtomicU64,
     /// The plugin is stopping: work in flight is let go, to be done next time.
-    closing: AtomicBool,
+    closing: Arc<AtomicBool>,
     /// No request goes to a server before this ([`START_QUIET`]).
     quiet_until: Instant,
 }
@@ -86,6 +88,9 @@ fn check_servers(servers: &[Server]) -> Result<(), String> {
                 return Err(format!("server \"{}\": the {what} must start with http:// or https://", s.name.trim()));
             }
         }
+        if s.split_long_calls && s.short_url.trim().is_empty() {
+            return Err(format!("server \"{}\" splits long calls into pieces for its address for short calls, and has none", s.name.trim()));
+        }
         if servers[..i].iter().any(|o| o.name.trim().eq_ignore_ascii_case(s.name.trim())) {
             return Err(format!("two servers are called \"{}\"", s.name.trim()));
         }
@@ -105,6 +110,8 @@ struct Route {
     copies: Vec<String>,
     /// An earlier call being caught up on: the give-up age doesn't apply.
     backfill: bool,
+    /// A long call to be cut into pieces for a short-window server.
+    split: bool,
 }
 
 fn route(call: &ConcludedCall) -> Option<Route> {
@@ -117,12 +124,13 @@ fn route(call: &ConcludedCall) -> Option<Route> {
         prompt: text("prompt"),
         copies,
         backfill: r.get("backfill").and_then(Value::as_bool).unwrap_or(false),
+        split: r.get("split").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
 /// One try at a queued call.
 fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> Attempt {
-    let Some(Route { url, server, prompt, copies, backfill }) = route(call) else {
+    let Some(Route { url, server, prompt, copies, backfill, split }) = route(call) else {
         return Attempt::Fail("the call has no server to go to".into());
     };
     if let Some(limit) = shared.give_up.filter(|_| !backfill) {
@@ -137,8 +145,8 @@ fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> At
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Attempt::Skip("the audio has been deleted".into()),
         Err(e) => return Attempt::Retry(format!("{}: {e}", path.display())),
     };
-    let audio = match wav::for_whisper(&audio) {
-        Ok(a) => a,
+    let pieces = match wav::pieces_for_whisper(&audio, split.then_some(PIECE_SECONDS)) {
+        Ok(p) => p,
         Err(e) => return Attempt::Fail(format!("{}: {e}", path.display())),
     };
     // Let any request the last run left in flight finish before a new one is sent.
@@ -152,9 +160,24 @@ fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> At
     // it twenty seconds): the call is kept for next time and the answer, if it comes, is dropped.
     let (tx, rx) = mpsc::channel();
     {
-        let (client, url, prompt) = (client.clone(), url.clone(), prompt.clone());
+        let (client, url, prompt, closing) = (client.clone(), url.clone(), prompt.clone(), shared.closing.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(client.transcribe(&url, &audio, &prompt));
+            // A long call's pieces go one after another, so every job on the GPU is a short one.
+            let mut parts: Vec<(f64, Transcript)> = Vec::new();
+            for (offset, audio) in pieces {
+                if closing.load(Ordering::Relaxed) {
+                    return;
+                }
+                match client.transcribe(&url, &audio, &prompt) {
+                    Ok(t) => parts.push((offset, t)),
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+            let whole = if parts.len() == 1 { parts.remove(0).1 } else { Transcript::join(parts) };
+            let _ = tx.send(Ok(whole));
         });
     }
     let answer = loop {
@@ -258,9 +281,14 @@ fn join_within(handle: JoinHandle<()>, within: Duration) {
 fn routed(shared: &Shared, group: &Group, backfill: bool, url: Option<&str>) -> ConcludedCall {
     let server = &shared.servers[group.best.server];
     let mut call = group.best.call.clone();
-    let url = url.unwrap_or_else(|| pick_url(server, call.call.call_length));
+    // A long call the server is set to split goes in pieces to its short-call address.
+    let split = url.is_none() && server.split_long_calls && !server.short_url.trim().is_empty() && call.call.call_length > server.short_seconds;
+    let url = if split { server.short_url.trim() } else { url.unwrap_or_else(|| pick_url(server, call.call.call_length)) };
     let prompt = shared.systems.get(&call.call.short_name).map(|(_, p)| p.clone()).unwrap_or_default();
-    call.call.extra.insert(ROUTE.into(), json!({ "url": url, "server": server.name.trim(), "prompt": prompt, "copies": group.copies, "backfill": backfill }));
+    call.call.extra.insert(
+        ROUTE.into(),
+        json!({ "url": url, "server": server.name.trim(), "prompt": prompt, "copies": group.copies, "backfill": backfill, "split": split }),
+    );
     call
 }
 
@@ -379,7 +407,7 @@ impl Plugin for Whisper {
             min_call_s: cfg.min_call_seconds,
             give_up: (cfg.give_up_minutes > 0.0).then(|| Duration::from_secs_f64(cfg.give_up_minutes * 60.0)),
             transcribed: AtomicU64::new(0),
-            closing: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
             quiet_until: Instant::now() + START_QUIET,
         });
         if shared.systems.is_empty() {
@@ -604,7 +632,7 @@ mod tests {
             min_call_s: 1.0,
             give_up: None,
             transcribed: AtomicU64::new(0),
-            closing: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
             quiet_until: Instant::now(),
         }
     }
@@ -721,7 +749,13 @@ mod tests {
 
     #[test]
     fn short_calls_go_to_the_short_address_when_there_is_one() {
-        let both = Server { name: "accurate".into(), url: " http://a/inference ".into(), short_url: "http://b/inference".into(), short_seconds: 12.0 };
+        let both = Server {
+            name: "accurate".into(),
+            url: " http://a/inference ".into(),
+            short_url: "http://b/inference".into(),
+            short_seconds: 12.0,
+            ..Default::default()
+        };
         assert_eq!(pick_url(&both, 5.0), "http://b/inference");
         assert_eq!(pick_url(&both, 12.0), "http://b/inference");
         assert_eq!(pick_url(&both, 12.5), "http://a/inference");
@@ -734,7 +768,13 @@ mod tests {
         let dir = temp("lane");
         let s = shared(
             &dir,
-            vec![Server { name: "accurate".into(), url: "http://a/inference".into(), short_url: "http://b/inference".into(), short_seconds: 12.0 }],
+            vec![Server {
+                name: "accurate".into(),
+                url: "http://a/inference".into(),
+                short_url: "http://b/inference".into(),
+                short_seconds: 12.0,
+                ..Default::default()
+            }],
         );
         let queue =
             Mutex::new(CallQueue::start(Host::to_writer(std::io::sink()), QueueOptions { threads: 0, ..Default::default() }, |_| Attempt::Skip(String::new())));
@@ -794,6 +834,73 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A server that answers each request with the next of `texts`, one segment of `1.0` s, and counts them.
+    fn counting_server(texts: Vec<&'static str>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/inference", l.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        std::thread::spawn(move || {
+            for text in texts.into_iter().cycle() {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut got = Vec::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    let k = s.read(&mut buf).unwrap_or(0);
+                    got.extend_from_slice(&buf[..k]);
+                    let t = String::from_utf8_lossy(&got).to_string();
+                    if let Some(h) = t.find("\r\n\r\n") {
+                        let len = t
+                            .to_lowercase()
+                            .split("content-length: ")
+                            .nth(1)
+                            .and_then(|r| r.split("\r\n").next())
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if got.len() >= h + 4 + len || k == 0 {
+                            break;
+                        }
+                    }
+                }
+                c.fetch_add(1, Ordering::SeqCst);
+                let body = format!(r#"{{"language":"en","duration":1.0,"segments":[{{"start":0.0,"end":1.0,"text":" {text}"}}]}}"#);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        (url, count)
+    }
+
+    #[test]
+    fn a_long_call_is_sent_in_pieces_and_comes_back_as_one_transcript_in_order() {
+        let dir = temp("pieces");
+        let (url, count) = counting_server(vec!["One.", "Two.", "Three.", "Four.", "Five."]);
+        // 30 s of speech-like bursts with pauses, at the recorder's 8 kHz.
+        let mut samples: Vec<i16> = Vec::new();
+        while samples.len() < 30 * 8000 {
+            samples.extend((0..20_000).map(|i| (9000.0 * (i as f64 * 0.2).sin()) as i16));
+            samples.extend(std::iter::repeat_n(3i16, 3200));
+        }
+        samples.truncate(30 * 8000);
+        let path = "sys/a/5-1_1.0";
+        let wav = dir.join(format!("{path}.wav"));
+        std::fs::create_dir_all(wav.parent().unwrap()).unwrap();
+        std::fs::write(&wav, wav::write(&samples, 8000)).unwrap();
+        let mut rec =
+            CallRecord { talkgroup: 5, short_name: "sys".into(), call_length: 30.0, start_time: unix_now(), stop_time: unix_now(), ..Default::default() };
+        rec.extra.insert(ROUTE.into(), json!({ "url": url, "server": "accurate", "prompt": "", "copies": [], "split": true }));
+        let c = ConcludedCall { path: path.into(), call: rec, files: trunk_recorder_plugin::CallFiles { wav, ..Default::default() }, ..Default::default() };
+        let expected = wav::pieces_for_whisper(&wav::write(&samples, 8000), Some(PIECE_SECONDS)).unwrap();
+        assert!(expected.len() >= 3);
+        assert!(matches!(transcribe_call(&shared(&dir, vec![]), &Client::new(Duration::from_secs(10)), &c), Attempt::Done { .. }));
+        assert_eq!(count.load(Ordering::SeqCst), expected.len(), "one request a piece");
+        let out: Value = serde_json::from_slice(&std::fs::read(dir.join(format!("{path}.transcript.json"))).unwrap()).unwrap();
+        let words = ["One.", "Two.", "Three.", "Four.", "Five."];
+        assert_eq!(out["text"], words[..expected.len()].join(" "));
+        let starts: Vec<f64> = out["segments"].as_array().unwrap().iter().map(|s| s["start"].as_f64().unwrap()).collect();
+        assert_eq!(starts, expected.iter().map(|p| p.0).collect::<Vec<_>>(), "each piece's words are at where it starts");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn servers_are_checked_with_a_reason() {
         let s = |n: &str, u: &str| Server { name: n.into(), url: u.into(), ..Default::default() };
@@ -802,5 +909,9 @@ mod tests {
         assert!(check_servers(&[s("fast", "x:8080")]).unwrap_err().contains("http"));
         assert!(check_servers(&[s("Fast", "http://x"), s("fast", "http://y")]).unwrap_err().contains("two servers"));
         assert!(check_servers(&[s("skip", "http://x")]).unwrap_err().contains("skip"));
+        let split_without_short = Server { split_long_calls: true, ..s("accurate", "http://x") };
+        assert!(check_servers(&[split_without_short]).unwrap_err().contains("splits long calls"));
+        let split = Server { split_long_calls: true, short_url: "http://y".into(), ..s("accurate", "http://x") };
+        assert!(check_servers(&[split]).is_ok());
     }
 }

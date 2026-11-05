@@ -21,7 +21,7 @@ In the plugin's settings:
 
 | Setting | Key | What it does |
 |---|---|---|
-| Whisper servers | `servers` | The servers, each with a **name** (`fast`, `accurate`), an **address** (`http://127.0.0.1:8081/inference`), and optionally an **address for short calls** with the length that counts as short. The first server is the default. |
+| Whisper servers | `servers` | The servers, each with a **name** (`fast`, `accurate`), an **address** (`http://127.0.0.1:8081/inference`), and optionally an **address for short calls** with the length that counts as short, and **split long calls** (`splitLongCalls`): cut a call longer than that at pauses into pieces of up to 12 seconds, send them one after another to the short-call address, and join the words. The first server is the default. |
 | Vocabulary hint | `prompt` | A sentence of words to expect ("Police and fire dispatch radio traffic in Collin County, Texas: …"). Helps names and jargon. A system can use its own. |
 | One server at a time | `oneAtATime` | On by default: calls go to the servers one at a time. Keep it on when they share a GPU, because two at once can hang it. |
 | Shortest call to transcribe | `minCallSeconds` | Shorter calls are mostly a key-up. |
@@ -46,7 +46,7 @@ dispatch to the accurate server, and everything else to the fast one:
   "plugins": { "whisper": { "enabled": true, "path": "/opt/trunk-pro/plugins/whisper", "shareDecrypted": true,
     "settings": { "servers": [
       { "name": "fast", "url": "http://127.0.0.1:8081/inference" },
-      { "name": "accurate", "url": "http://127.0.0.1:8081/inference", "shortUrl": "http://127.0.0.1:8082/inference" } ] } } },
+      { "name": "accurate", "url": "http://127.0.0.1:8081/inference", "shortUrl": "http://127.0.0.1:8082/inference", "splitLongCalls": true } ] } } },
   "systems": [ { "shortName": "pawmco", "plugins": { "whisper": { "transcribe": true, "tier": "fast", "rules": [
       { "talkgroups": ["21", "24", "25", "112-113"], "tier": "skip" },
       { "text": "Plano PD, Plano FD", "tier": "accurate" },
@@ -130,8 +130,10 @@ And **an Arc GPU resets if one job runs longer than about 7.5 seconds** (the Lin
 A large model with the full 30-second audio window takes about 9 seconds for one encoder pass, so every long call
 sent to it hung the GPU ("GPU HANG … context reset" in `dmesg`), killing the request and sometimes the server.
 Short-window servers (`-ac 640`, about 3 s a pass) and small.en ran for hours without a problem. So on this kind of
-GPU give a large model only the short window, and send long calls to a smaller model with the full window (the
-`accurate` server's address, as in the example above). Starting several servers at once, or sending two servers
+GPU give a large model only the short window. Long calls then either go whole to a smaller model with the full
+window (the `accurate` server's address), or, with `splitLongCalls`, are cut at pauses into pieces of up to 12 seconds
+that the short-window model takes one at a time, which keeps every job short and gives long calls the large
+model's quality too. Starting several servers at once, or sending two servers
 work at once, makes it worse; **One server at a time** and a 45-second quiet period after the plugin starts are
 for that.
 
