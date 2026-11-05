@@ -15,6 +15,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: # run on the tag: `gh workflow run release.yml --ref v0.1.0`
 
 permissions:
   contents: write
@@ -138,4 +139,3 @@ jobs:
         with:
           body_path: notes.md
           files: dist/*
-
