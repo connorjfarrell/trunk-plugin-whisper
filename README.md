@@ -97,6 +97,9 @@ already have a transcript are skipped, so leaving it set is harmless. `backfill.
 which Whisper needs to avoid inventing words in the gaps. `EXTRA_CPU_CORES=6 ./run.sh` also starts a CPU copy on
 `8084`, for the plugin's `backfill.extraUrl`.
 
+After a reboot, `server/after-reboot.sh` starts the three GPU servers one at a time, checking each answers before
+the next starts: Arc GPUs can hang when several Vulkan processes start together.
+
 **Start the servers with `--no-context`** (`run.sh` does). By default whisper-server carries the previous call's
 text into the next call as context, so every call after a garbled one comes out as the same looping phrase. Each
 call here is its own conversation, so it must be transcribed on its own. Models come from
