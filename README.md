@@ -73,6 +73,12 @@ were never encrypted. Calls that couldn't be decrypted are never transcribed.
 `copy_of` names the other system's copy that was transcribed, when this call was the second recording of the
 same conversation. `repeated: true` means a phrase came out three or more times in a row and was cut to one.
 
+## Status
+
+The plugin's status line in the recorder says how many new calls are waiting and how far the backfill has got:
+"12 new calls waiting. Earlier calls: 3,210 of 4,718 left (32% done), about 7 h 30 min to go". The time left is
+worked out from how many earlier calls were finished in the last ten minutes, so it appears after a few minutes.
+
 ## Newest first
 
 When the servers are behind, the call handed over next is always the newest one waiting, so the latest calls get

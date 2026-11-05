@@ -13,7 +13,7 @@ mod plan;
 mod wav;
 mod whisper;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -60,6 +60,11 @@ struct Shared {
     closing: Arc<AtomicBool>,
     /// No request goes to a server before this ([`START_QUIET`]).
     quiet_until: Instant,
+    /// The backfill: the conversations it found to do, and how many it has finished (done, skipped or failed).
+    backfill_total: AtomicU64,
+    backfill_finished: AtomicU64,
+    /// When the last backfill conversations finished, for the rate.
+    finish_times: Mutex<VecDeque<Instant>>,
 }
 
 struct Whisper {
@@ -132,8 +137,22 @@ fn route(call: &ConcludedCall) -> Option<Route> {
     })
 }
 
-/// One try at a queued call.
+/// One try at a queued call; an earlier call (backfill) that is done with, one way or another, is counted.
 fn transcribe_call(shared: &Shared, client: &Client, call: &ConcludedCall) -> Attempt {
+    let outcome = transcribe_call_inner(shared, client, call);
+    if !matches!(outcome, Attempt::Retry(_)) && route(call).is_some_and(|r| r.backfill) {
+        shared.backfill_finished.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let mut t = shared.finish_times.lock().unwrap();
+        t.push_back(now);
+        while t.front().is_some_and(|f| now.duration_since(*f) > Duration::from_secs(15 * 60)) {
+            t.pop_front();
+        }
+    }
+    outcome
+}
+
+fn transcribe_call_inner(shared: &Shared, client: &Client, call: &ConcludedCall) -> Attempt {
     let Some(Route { url, server, prompt, copies, backfill, split }) = route(call) else {
         return Attempt::Fail("the call has no server to go to".into());
     };
@@ -224,6 +243,8 @@ fn run_backfill(from: i64, since: &str, only: &[String], shared: &Shared, waitin
         groups.len(),
         seen.done_already
     ));
+    shared.backfill_total.store(groups.len() as u64, Ordering::Relaxed);
+    shared.backfill_finished.store(0, Ordering::Relaxed);
     for group in groups {
         waiting.add(group, true);
     }
@@ -385,6 +406,53 @@ fn group_from_call(call: ConcludedCall, servers: &[Server]) -> Option<(Group, bo
     Some((Group { best: Entry { arrived: Instant::now(), call, server }, copies: r.copies }, r.backfill))
 }
 
+/// 12345 as "12,345".
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// How long, as "7 h 30 min", "45 min" or "under a minute".
+fn how_long(minutes: f64) -> String {
+    let m = minutes.round() as u64;
+    match (m / 60, m % 60) {
+        (0, 0) => "under a minute".into(),
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+/// The status line: what is waiting, and how far the backfill has got, with the time left at the recent rate
+/// (`per_min`: backfill conversations finished a minute, over the last ten minutes; `None` until there's a rate).
+fn progress_text(new_waiting: usize, total: u64, finished: u64, per_min: Option<f64>) -> String {
+    let new = match new_waiting {
+        0 => "No new calls waiting".to_string(),
+        1 => "1 new call waiting".to_string(),
+        n => format!("{} new calls waiting", thousands(n as u64)),
+    };
+    if total == 0 {
+        return new;
+    }
+    let left = total.saturating_sub(finished);
+    if left == 0 {
+        return format!("{new}. Earlier calls: all {} done", thousands(total));
+    }
+    let percent = 100 * finished / total;
+    let eta = match per_min {
+        Some(r) if r >= 0.1 => format!(", about {} to go", how_long(left as f64 / r)),
+        _ => ", estimating the time left".to_string(),
+    };
+    format!("{new}. Earlier calls: {} of {} left ({percent}% done){eta}", thousands(left), thousands(total))
+}
+
 impl Plugin for Whisper {
     type Config = Config;
     type SystemConfig = SystemConfig;
@@ -429,6 +497,9 @@ impl Plugin for Whisper {
             transcribed: AtomicU64::new(0),
             closing: Arc::new(AtomicBool::new(false)),
             quiet_until: Instant::now() + START_QUIET,
+            backfill_total: AtomicU64::new(0),
+            backfill_finished: AtomicU64::new(0),
+            finish_times: Mutex::new(VecDeque::new()),
         });
         if shared.systems.is_empty() {
             host.status(State::Warning, "No system is set to transcribe. Turn it on in a system's settings.");
@@ -511,7 +582,8 @@ impl Plugin for Whisper {
         let worker = std::thread::Builder::new()
             .name("whisper-gather".into())
             .spawn(move || {
-                let (mut last, mut told) = (0, Instant::now());
+                let (mut last, mut told, mut said) = (0, Instant::now(), Instant::now() - Duration::from_secs(60));
+                let mut last_text = String::new();
                 loop {
                     match rx.recv_timeout(Duration::from_millis(50)) {
                         Err(RecvTimeoutError::Timeout) => {}
@@ -525,6 +597,20 @@ impl Plugin for Whisper {
                     while q.lock().unwrap().len() < 2 {
                         let Some(item) = w.pop_newest() else { break };
                         enqueue(&sh, &q, item.group, item.backfill);
+                    }
+                    if said.elapsed() >= Duration::from_secs(15) {
+                        said = Instant::now();
+                        let (total, finished) = (sh.backfill_total.load(Ordering::Relaxed), sh.backfill_finished.load(Ordering::Relaxed));
+                        let per_min = {
+                            let t = sh.finish_times.lock().unwrap();
+                            let recent = t.iter().filter(|f| f.elapsed() <= Duration::from_secs(600)).count();
+                            (recent >= 5).then(|| recent as f64 / 10.0)
+                        };
+                        let text = progress_text(w.counts().0 + q.lock().unwrap().len(), total, finished, per_min);
+                        if text != last_text {
+                            h.status(State::Ok, text.clone());
+                            last_text = text;
+                        }
                     }
                     if told.elapsed() >= Duration::from_secs(300) {
                         told = Instant::now();
@@ -656,6 +742,9 @@ mod tests {
             transcribed: AtomicU64::new(0),
             closing: Arc::new(AtomicBool::new(false)),
             quiet_until: Instant::now(),
+            backfill_total: AtomicU64::new(0),
+            backfill_finished: AtomicU64::new(0),
+            finish_times: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -920,6 +1009,44 @@ mod tests {
         assert_eq!(out["text"], words[..expected.len()].join(" "));
         let starts: Vec<f64> = out["segments"].as_array().unwrap().iter().map(|s| s["start"].as_f64().unwrap()).collect();
         assert_eq!(starts, expected.iter().map(|p| p.0).collect::<Vec<_>>(), "each piece's words are at where it starts");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_status_line_says_how_far_the_backfill_has_got_and_how_long_is_left() {
+        assert_eq!(progress_text(0, 0, 0, None), "No new calls waiting");
+        assert_eq!(progress_text(1, 0, 0, None), "1 new call waiting");
+        assert_eq!(progress_text(12, 4718, 1718, Some(10.0)), "12 new calls waiting. Earlier calls: 3,000 of 4,718 left (36% done), about 5 h to go");
+        assert_eq!(progress_text(0, 4718, 100, None), "No new calls waiting. Earlier calls: 4,618 of 4,718 left (2% done), estimating the time left");
+        assert_eq!(progress_text(0, 500, 500, Some(8.0)), "No new calls waiting. Earlier calls: all 500 done");
+        assert_eq!(how_long(0.2), "under a minute");
+        assert_eq!(how_long(45.0), "45 min");
+        assert_eq!(how_long(450.0), "7 h 30 min");
+        assert_eq!(thousands(1234567), "1,234,567");
+        assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn an_earlier_call_that_is_finished_is_counted_and_a_retry_is_not() {
+        let dir = temp("counted");
+        let url = server(1, ANSWER);
+        let s = shared(&dir, vec![]);
+        let mut done = call(&dir, "sys/a/5-1_1.0", &url, &[], 0);
+        done.call.extra.insert(ROUTE.into(), json!({ "url": url, "server": "accurate", "prompt": "", "copies": [], "backfill": true }));
+        assert!(matches!(transcribe_call(&s, &Client::new(Duration::from_secs(5)), &done), Attempt::Done { .. }));
+        assert_eq!(s.backfill_finished.load(Ordering::Relaxed), 1);
+        let mut retry = call(&dir, "sys/a/5-2_1.0", "http://127.0.0.1:9/inference", &[], 0);
+        retry
+            .call
+            .extra
+            .insert(ROUTE.into(), json!({ "url": "http://127.0.0.1:9/inference", "server": "accurate", "prompt": "", "copies": [], "backfill": true }));
+        assert!(matches!(transcribe_call(&s, &Client::new(Duration::from_secs(2)), &retry), Attempt::Retry(_)));
+        assert_eq!(s.backfill_finished.load(Ordering::Relaxed), 1, "a try that will be repeated isn't a finish");
+        // A new call's finish isn't the backfill's.
+        let url2 = server(1, ANSWER);
+        let new = call(&dir, "sys/a/5-3_1.0", &url2, &[], 0);
+        assert!(matches!(transcribe_call(&s, &Client::new(Duration::from_secs(5)), &new), Attempt::Done { .. }));
+        assert_eq!(s.backfill_finished.load(Ordering::Relaxed), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
