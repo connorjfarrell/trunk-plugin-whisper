@@ -22,6 +22,7 @@ In the plugin's settings:
 | Setting | Key | What it does |
 |---|---|---|
 | Whisper servers | `servers` | The servers, each with a **name** (`fast`, `accurate`), an **address** (`http://127.0.0.1:8081/inference`), and optionally an **address for short calls** with the length that counts as short, and **split long calls** (`splitLongCalls`): cut a call longer than that at pauses into pieces of up to 12 seconds, send them one after another to the short-call address, and join the words. The first server is the default. |
+| Helper servers | `helpers` | Other machines that take calls too, when they're free: a **name**, an **address**, and whether they take everything or only earlier calls. A helper takes the newest call waiting whenever it is free, cuts a long call into pieces for its short-window address, and signs its transcripts with its own name. See [a Mac as a helper](server/mac/README.md). |
 | Vocabulary hint | `prompt` | A sentence of words to expect ("Police and fire dispatch radio traffic in Collin County, Texas: …"). Helps names and jargon. A system can use its own. |
 | One server at a time | `oneAtATime` | On by default: calls go to the servers one at a time. Keep it on when they share a GPU, because two at once can hang it. |
 | Shortest call to transcribe | `minCallSeconds` | Shorter calls are mostly a key-up. |
@@ -78,6 +79,14 @@ same conversation. `repeated: true` means a phrase came out three or more times 
 The plugin's status line in the recorder says how many new calls are waiting and how far the backfill has got:
 "12 new calls waiting. Earlier calls: 3,210 of 4,718 left (32% done), about 7 h 30 min to go". The time left is
 worked out from how many earlier calls were finished in the last ten minutes, so it appears after a few minutes.
+
+## What the recorder sees
+
+Every worker (the main servers' lane and each helper) takes the newest waiting call it may, and the plugin tells the
+recorder what became of each call (done, skipped or failed). Its queue figure is everything waiting, new and
+earlier, so the recorder's graph shows the real backlog; it also reports each server's state (up, or down when it
+stops answering). A call a server won't answer for is tried again after a growing pause (5 s, 30 s, 2 min, 10 min) and
+given up on after five tries, with the reason.
 
 ## Newest first
 

@@ -36,6 +36,44 @@ impl Default for Server {
     }
 }
 
+/// Which calls a helper takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum Takes {
+    /// New and earlier calls
+    #[default]
+    Everything,
+    /// Earlier calls only
+    Earlier,
+}
+
+/// Helper server
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Helper {
+    /// Name
+    ///
+    /// Written into the transcripts it makes ("mac").
+    pub name: String,
+    /// Address
+    ///
+    /// Its inference address, as for a server. Start it with the short audio window (whisper-server -ac 640): a call longer than the length below is cut into pieces that fit.
+    pub url: String,
+    /// Short calls are up to (seconds)
+    #[schemars(range(min = 1, max = 30))]
+    pub short_seconds: f64,
+    /// Calls it takes
+    ///
+    /// A helper works beside the servers above, taking the newest call waiting whenever it is free, whichever tier the call was given; its model does the work instead.
+    pub takes: Takes,
+}
+
+impl Default for Helper {
+    fn default() -> Self {
+        Helper { name: String::new(), url: String::new(), short_seconds: 12.0, takes: Takes::Everything }
+    }
+}
+
 /// Earlier folder
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -89,6 +127,10 @@ pub struct Config {
     ///
     /// The servers that do the work, one for each quality you want: a small model for most talkgroups and a larger, slower one for the ones that matter. Systems and rules pick by name. The first is the default.
     pub servers: Vec<Server>,
+    /// Helper servers
+    ///
+    /// Other machines that take calls as well (a Mac mini with a fast GPU, say) when they're free, so the backlog clears sooner and a busy hour is caught up with. Each is its own server, so it is told apart in the transcripts it makes.
+    pub helpers: Vec<Helper>,
     /// Vocabulary hint
     ///
     /// Words Whisper should expect, written as a sentence: "Police and fire dispatch radio traffic in Collin County, Texas: Plano, Allen, Wylie, Murphy. Ten-codes, medic, engine, ladder." It improves names and jargon. A system can use its own.
@@ -113,7 +155,15 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { servers: Vec::new(), prompt: String::new(), backfill: Backfill::default(), one_at_a_time: true, min_call_seconds: 1.0, give_up_minutes: 0.0 }
+        Config {
+            servers: Vec::new(),
+            helpers: Vec::new(),
+            prompt: String::new(),
+            backfill: Backfill::default(),
+            one_at_a_time: true,
+            min_call_seconds: 1.0,
+            give_up_minutes: 0.0,
+        }
     }
 }
 

@@ -13,6 +13,12 @@ Each version's section is its GitHub release notes.
   transcript is written beside both.
 - Calls are transcribed newest first: new and earlier calls wait in one list and the newest goes to a server next,
   so the latest calls get their words quickly however far behind the servers are.
+- The plugin works the waiting calls itself, not through the SDK's queue, so the recorder's queue graph shows
+  everything waiting (new and earlier), each finished call is reported (including the helpers'), and each server's
+  state is shown. A server that doesn't answer is tried again after a growing pause; a call is given up on after
+  five tries.
+- Helper servers: other machines (a Mac mini, say) take the newest waiting call whenever they are free, new or
+  earlier, and sign the transcripts they make with their own name. `server/mac/` has the launchd job and tunnel.
 - The status line says how many new calls are waiting and how far the backfill has got, with the time left at the
   recent rate.
 - The backfill can search folders of calls recorded under a name the recorder no longer has (a system renamed or
