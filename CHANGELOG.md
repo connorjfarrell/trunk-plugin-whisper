@@ -2,7 +2,7 @@
 
 Each version's section is its GitHub release notes.
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-11-04
 
 - First release: transcribes recorded calls with a Whisper server (whisper.cpp's `whisper-server`) and writes
   each transcript beside its call as `<call>.transcript.json`.
